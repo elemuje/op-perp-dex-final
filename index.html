@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- SEO -->
+    <title>OPPerpDEX — Perpetual Futures on Bitcoin</title>
+    <meta name="description" content="The first decentralized perpetual futures exchange on OPNet Bitcoin L2. Trade BTC, ETH, SOL and more with up to 50× leverage. Non-custodial, sub-cent fees." />
+    <meta name="keywords" content="OPNet, Bitcoin, DeFi, perpetual futures, DEX, crypto trading, Bitcoin L2" />
+
+    <!-- Open Graph -->
+    <meta property="og:title" content="OPPerpDEX — Perpetual Futures on Bitcoin" />
+    <meta property="og:description" content="Trade perpetual futures on Bitcoin with up to 50× leverage. Built on OPNet L2." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://op-perpdex.vercel.app" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="OPPerpDEX — Perpetual Futures on Bitcoin" />
+    <meta name="twitter:description" content="Trade perpetual futures on OPNet Bitcoin L2. 50× leverage, non-custodial." />
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <!-- Fonts preload -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body, #root { height: 100%; }
+      body {
+        background: #030a0a;
+        color: #e8f5f2;
+        font-family: sans-serif;
+        overflow-x: hidden;
+      }
+      /* Loading screen shown before React mounts */
+      #loading {
+        position: fixed;
+        inset: 0;
+        background: #030a0a;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        transition: opacity 0.4s ease;
+      }
+      #loading.hidden { opacity: 0; pointer-events: none; }
+      .loader-logo {
+        width: 48px;
+        height: 48px;
+        background: linear-gradient(135deg, #00d4a0, #006a50);
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #000;
+        font-weight: 900;
+        font-size: 24px;
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50%       { transform: scale(1.08); opacity: 0.8; }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Loading screen -->
+    <div id="loading">
+      <div class="loader-logo">Ω</div>
+    </div>
+
+    <!-- React root -->
+    <div id="root"></div>
+
+    <script type="module" src="/src/main.jsx"></script>
+    <script>
+      // Hide loader once React has painted
+      window.addEventListener('load', () => {
+        setTimeout(() => {
+          const l = document.getElementById('loading');
+          if (l) { l.classList.add('hidden'); setTimeout(() => l.remove(), 400); }
+        }, 300);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,43 @@
+/* Global resets — all component styles are in App.jsx */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  background: #030a0a;
+  color: #e8f5f2;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Remove number input spinners globally */
+input[type=number] {
+  -moz-appearance: textfield;
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+}
+
+/* Thin scrollbars */
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: #030a0a; }
+::-webkit-scrollbar-thumb { background: #0d2020; border-radius: 2px; }
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid #00d4a040;
+  outline-offset: 2px;
+}

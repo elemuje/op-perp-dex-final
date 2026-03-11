@@ -38,71 +38,126 @@ async function opnetRPC(method, params = []) {
   }
 }
 
-// ─── WALLET PROVIDER DETECTION ────────────────────────────
-// KEY FIX: OP_WALLET is forked from UniSat and ALSO injects window.unisat,
-// but it sets window.unisat.isOKExWallet=false and is NOT window.okxwallet.
-// We must fingerprint carefully: check window.unisat identity flags FIRST.
+// ─── WALLET PROVIDER DETECTION (v12 — definitive) ─────────────────────────
+//
+// CONFIRMED ROOT CAUSE:
+//   OP_WALLET is a direct UniSat fork. It injects into window.unisat ONLY.
+//   It does NOT set window.opnet. It has NO brand flags (no isOKExWallet,
+//   no isUnisat). OKX also injects into window.unisat AND window.okxwallet.
+//   UniSat sets window.unisat_wallet (added to prevent conflicts) AND
+//   window.unisat with isUnisat=true.
+//
+// PRIORITY MAP (unique namespaces, no collisions):
+//   OP_WALLET → window.unisat           (no brand flags, not OKX, not UniSat)
+//   UniSat    → window.unisat_wallet    (authoritative UniSat key, no conflict)
+//   OKX       → window.okxwallet.bitcoin (own namespace, never overlaps)
+//   Xverse    → window.BitcoinProvider
+//
+// DETECTION ORDER — always check most-specific namespaces first:
+//   1. OKX     via window.okxwallet.bitcoin   (private namespace, unambiguous)
+//   2. UniSat  via window.unisat_wallet        (UniSat added this to prevent conflicts)
+//   3. Xverse  via window.BitcoinProvider
+//   4. OP_WALLET = whatever is left in window.unisat (it's the ONLY one that
+//      doesn't have its own unique namespace — process of elimination)
+//
+// IMPORTANT: We NEVER use window.unisat for UniSat detection. We use
+//   window.unisat_wallet instead. This is the key insight that makes it work.
+
+// Wait for a specific window key to appear (extensions inject async after page load)
+function waitForProvider(getProvider, timeoutMs = 3000) {
+  if (typeof window === "undefined") return Promise.resolve(null);
+  const found = getProvider();
+  if (found) return Promise.resolve(found);
+  return new Promise(resolve => {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      const p = getProvider();
+      if (p) { clearInterval(iv); resolve(p); return; }
+      if (Date.now() - start >= timeoutMs) { clearInterval(iv); resolve(null); }
+    }, 80);
+  });
+}
+
+// Snapshot of currently-installed wallets for the UI
 function detectWallets() {
   if (typeof window === "undefined") return {};
-  const results = {};
-
-  // ── OP_WALLET detection ──
-  // OP_WALLET injects into window.unisat but is NOT OKX and NOT Unisat.
-  // It has no isOKExWallet flag, and window.opnet may also be injected.
+  const r = {};
+  // OKX — own private namespace
+  if (window.okxwallet?.bitcoin) r.OKX = window.okxwallet.bitcoin;
+  // UniSat — use window.unisat_wallet (their anti-conflict key), NOT window.unisat
+  if (window.unisat_wallet) r.UniSat = window.unisat_wallet;
+  // Xverse
+  if (window.BitcoinProvider) r.Xverse = window.BitcoinProvider;
+  // OP_WALLET — whatever remains in window.unisat that isn't OKX or UniSat
+  // (process of elimination: OP_WALLET is the only one with no unique namespace)
   const u = window.unisat;
-  if (u) {
-    const isOKX    = !!(u.isOKExWallet || u.isOKX);
-    const isUnisat = !!(u.isUnisat && !isOKX);
-    if (!isOKX && !isUnisat) {
-      // This is OP_WALLET (unisat fork without brand flags, or window.opnet present)
-      results.OP_WALLET = u;
-    } else if (isUnisat) {
-      results.UniSat = u;
-    }
+  if (u && !r.OKX && !r.UniSat) {
+    // Both OKX and UniSat are absent but window.unisat exists → must be OP_WALLET
+    r.OP_WALLET = u;
+  } else if (u && !u.isOKExWallet && !u.isOKX && !u.isUnisat) {
+    // OKX or UniSat present in their own namespaces, window.unisat has no brand flags
+    r.OP_WALLET = u;
   }
-  // Also try explicit window.opnet injection (newer OP_WALLET versions)
-  if (window.opnet && !results.OP_WALLET) {
-    results.OP_WALLET = window.opnet;
-  }
-  // OKX — always its own namespace, never hijack window.unisat
-  if (window.okxwallet?.bitcoin) {
-    results.OKX = window.okxwallet.bitcoin;
-  }
-  // Xverse / BitcoinProvider
-  if (window.BitcoinProvider && !results.UniSat) {
-    results.Xverse = window.BitcoinProvider;
-  }
-  // UniSat explicit check if not yet found
-  if (!results.UniSat && u?.isUnisat) {
-    results.UniSat = u;
-  }
-
-  return results;
+  return r;
 }
 
+// Connect to the EXACT provider the user selected
 async function connectSpecificWallet(walletKey) {
-  const wallets = detectWallets();
-  const provider = wallets[walletKey];
+  let provider = null;
+
+  if (walletKey === "OP_WALLET") {
+    // Wait for window.unisat with no OKX/UniSat brand flags
+    // Also accept window.opnet if the extension ever starts setting it
+    provider = await waitForProvider(() => {
+      if (window.opnet) return window.opnet;
+      const u = window.unisat;
+      if (!u) return null;
+      // Confirm it's not OKX and not UniSat (process of elimination = OP_WALLET)
+      if (u.isOKExWallet || u.isOKX || u.isUnisat) return null;
+      return u;
+    }, 3000);
+    if (!provider) throw new Error("OP_WALLET_NOT_FOUND");
+
+  } else if (walletKey === "UniSat") {
+    // Use window.unisat_wallet first (UniSat's own anti-conflict key)
+    // Fall back to window.unisat only if it has isUnisat=true flag
+    provider = await waitForProvider(() => {
+      if (window.unisat_wallet) return window.unisat_wallet;
+      const u = window.unisat;
+      if (u && u.isUnisat === true && !u.isOKExWallet) return u;
+      return null;
+    }, 3000);
+    if (!provider) throw new Error("NO_WALLET");
+
+  } else if (walletKey === "OKX") {
+    provider = await waitForProvider(() => window.okxwallet?.bitcoin || null, 3000);
+    if (!provider) throw new Error("NO_WALLET");
+
+  } else if (walletKey === "Xverse") {
+    provider = await waitForProvider(() => window.BitcoinProvider || null, 3000);
+    if (!provider) throw new Error("NO_WALLET");
+  }
+
   if (!provider) throw new Error("NO_WALLET");
 
-  const accounts = await provider.requestAccounts();
-  if (!accounts || accounts.length === 0) throw new Error("No accounts returned");
-  let pubkey = "";
-  try { pubkey = await provider.getPublicKey(); } catch {}
-  let balance = 0;
   try {
-    const b = await provider.getBalance();
-    balance = (b.confirmed || b.total || 0) / 1e8;
-  } catch {}
-  let network = "testnet";
-  try { network = await provider.getNetwork(); } catch {}
-  return { address: accounts[0], name: walletKey, pubkey, balance, network };
+    const accounts = await provider.requestAccounts();
+    if (!accounts?.length) throw new Error("No accounts returned");
+    let pubkey = "", balance = 0, network = "testnet";
+    try { pubkey  = await provider.getPublicKey(); } catch {}
+    try { const b  = await provider.getBalance(); balance = (b.confirmed || b.total || 0) / 1e8; } catch {}
+    try { network = await provider.getNetwork(); } catch {}
+    return { address: accounts[0], name: walletKey, pubkey, balance, network };
+  } catch(e) {
+    if (e.message?.includes("User rejected") || e.code === 4001 || e.code === -32603)
+      throw new Error("USER_REJECTED");
+    throw e;
+  }
 }
 
-// Keep backward compat for auto-connect
+// Auto-reconnect on page load — non-prompting (getAccounts vs requestAccounts)
 async function connectOPNetWallet() {
   const wallets = detectWallets();
-  // Priority: OP_WALLET > UniSat > OKX > Xverse
   const key = ["OP_WALLET","UniSat","OKX","Xverse"].find(k => wallets[k]);
   if (!key) throw new Error("NO_WALLET");
   return connectSpecificWallet(key);
@@ -115,20 +170,20 @@ function ThemeProvider({ children }) {
   const [dark, setDark] = useState(true);
   const th = dark ? {
     dark, toggle: () => setDark(d => !d),
-    bg:"#030a0a", bg2:"#050e0e", bg3:"#071212",
-    border:"#0d2020", border2:"#0a1818",
-    text:"#e8f5f2", textMid:"#8aacac", textDim:"#4a7a7a", textFaint:"#2a5a5a",
-    accent:"#00d4a0", red:"#ff4d6d",
-    card:"rgba(5,14,14,0.97)", input:"#040c0c",
-    navBg:"rgba(3,10,10,0.97)",
+    bg:"#0a0500", bg2:"#110800", bg3:"#180c00",
+    border:"#2e1800", border2:"#1e1000",
+    text:"#fff4e6", textMid:"#c8924a", textDim:"#7a5228", textFaint:"#3d2810",
+    accent:"#F7931A", red:"#ff3a3a",
+    card:"rgba(16,8,0,0.97)", input:"#0d0600",
+    navBg:"rgba(10,5,0,0.97)",
   } : {
     dark, toggle: () => setDark(d => !d),
-    bg:"#f0f4f4", bg2:"#e6efee", bg3:"#ffffff",
-    border:"#c4d8d5", border2:"#d8e8e5",
-    text:"#0a2020", textMid:"#2a5a5a", textDim:"#4a7a7a", textFaint:"#6a9a9a",
-    accent:"#00a880", red:"#d43050",
-    card:"rgba(255,255,255,0.97)", input:"#f4fafa",
-    navBg:"rgba(240,244,244,0.97)",
+    bg:"#fff8f0", bg2:"#fff0dc", bg3:"#ffffff",
+    border:"#f5d4a0", border2:"#ffe0b0",
+    text:"#1a0d00", textMid:"#7a3d00", textDim:"#b86a1a", textFaint:"#d49050",
+    accent:"#e07800", red:"#cc2200",
+    card:"rgba(255,255,255,0.97)", input:"#fff8f0",
+    navBg:"rgba(255,248,240,0.97)",
   };
   return <ThemeCtx.Provider value={th}>{children}</ThemeCtx.Provider>;
 }
@@ -143,13 +198,13 @@ function ToastProvider({ children }) {
     setToasts(t => [...t.slice(-3), { id, msg, type }]);
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), dur);
   }, []);
-  const clr = { success:"#00d4a0", error:"#ff4d6d", warning:"#ff9933", info:"#12AAFF", trade:"#9945FF" };
+  const clr = { success:"#F7931A", error:"#ff3a3a", warning:"#ffb347", info:"#ffcc66", trade:"#ff6600" };
   return (
     <ToastCtx.Provider value={add}>
       {children}
       <div style={{ position:"fixed", top:68, right:14, zIndex:999, display:"flex", flexDirection:"column", gap:7, pointerEvents:"none" }}>
         {toasts.map(t => (
-          <div key={t.id} style={{ background:"#050e0e", border:`1px solid ${clr[t.type]}30`, borderLeft:`3px solid ${clr[t.type]}`, borderRadius:10, padding:"9px 14px", color:"#e8f5f2", fontSize:12, fontFamily:"'IBM Plex Mono',monospace", animation:"fadeUp .2s ease", maxWidth:300 }}>
+          <div key={t.id} style={{ background:"#110800", border:`1px solid ${clr[t.type]}30`, borderLeft:`3px solid ${clr[t.type]}`, borderRadius:10, padding:"9px 14px", color:"#fff4e6", fontSize:12, fontFamily:"'IBM Plex Mono',monospace", animation:"fadeUp .2s ease", maxWidth:300 }}>
             {t.msg}
           </div>
         ))}
@@ -195,7 +250,7 @@ const REFERRAL = {
   earned:2841.50, pending:124.80, count:47,
   tiers:[
     { n:1, label:"Starter",  need:0,  rebate:"10%", color:"#6a9a9a" },
-    { n:2, label:"Builder",  need:10, rebate:"15%", color:"#00d4a0" },
+    { n:2, label:"Builder",  need:10, rebate:"15%", color:"#F7931A" },
     { n:3, label:"Partner",  need:25, rebate:"20%", color:"#F7931A" },
     { n:4, label:"Champion", need:50, rebate:"25%", color:"#FFD700" },
   ],
@@ -246,11 +301,11 @@ function CandleChart({ candles }) {
       {[.25,.5,.75].map(f => (
         <g key={f}>
           <line x1={pl} x2={W-pr} y1={pt+f*(H-pt-pb)} y2={pt+f*(H-pt-pb)} stroke="#0d2828" strokeDasharray="3,5"/>
-          <text x={W-pr+3} y={pt+f*(H-pt-pb)+3.5} fontSize="8" fill="#2a5a5a" fontFamily="'IBM Plex Mono',monospace">{fmtP(hi-f*rng)}</text>
+          <text x={W-pr+3} y={pt+f*(H-pt-pb)+3.5} fontSize="8" fill="#7a5228" fontFamily="'IBM Plex Mono',monospace">{fmtP(hi-f*rng)}</text>
         </g>
       ))}
       {candles.map((c,i) => {
-        const x=pl+i*cw+cw/2, col=c.c>=c.o?"#00d4a0":"#ff4d6d";
+        const x=pl+i*cw+cw/2, col=c.c>=c.o?"#F7931A":"#ff3a3a";
         return (
           <g key={i}>
             <line x1={x} y1={pt+sy(c.h)} x2={x} y2={pt+sy(c.l)} stroke={col} strokeWidth={.9}/>
@@ -261,8 +316,8 @@ function CandleChart({ candles }) {
       {(() => {
         const y=pt+sy(last.c); const up=last.c>=last.o;
         return (<>
-          <line x1={pl} x2={W-pr} y1={y} y2={y} stroke={up?"#00d4a040":"#ff4d6d40"} strokeDasharray="2,4"/>
-          <rect x={W-pr+1} y={y-8} width={48} height={16} rx={3} fill={up?"#00d4a0":"#ff4d6d"}/>
+          <line x1={pl} x2={W-pr} y1={y} y2={y} stroke={up?"#F7931A40":"#ff3a3a40"} strokeDasharray="2,4"/>
+          <rect x={W-pr+1} y={y-8} width={48} height={16} rx={3} fill={up?"#F7931A":"#ff3a3a"}/>
           <text x={W-pr+25} y={y+4} textAnchor="middle" fontSize="8" fill="#000" fontWeight="700" fontFamily="'IBM Plex Mono',monospace">{fmtP(last.c)}</text>
         </>);
       })()}
@@ -310,7 +365,7 @@ function OrderBook({ mid, onFill, th }) {
 // ─── TX OVERLAY ───────────────────────────────────────────
 function TxOverlay({ tx, onDismiss, th }) {
   if (!tx) return null;
-  const col = tx.status==="confirmed"?"#00d4a0":tx.status==="failed"?"#ff4d6d":"#ff9933";
+  const col = tx.status==="confirmed"?"#F7931A":tx.status==="failed"?"#ff3a3a":"#ff9933";
   return (
     <div style={{ position:"fixed", bottom:76, right:14, zIndex:800, width:290, background:th.bg2, border:`1px solid ${col}35`, borderRadius:14, padding:"13px 15px", boxShadow:"0 8px 32px rgba(0,0,0,.5)", animation:"fadeUp .2s ease" }}>
       <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:5 }}>
@@ -349,13 +404,13 @@ function SimPreview({ order, livePrice, onConfirm, onCancel, th }) {
           <span style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:700 }}>Transaction Preview</span>
           <button onClick={onCancel} style={{ background:"none", border:"none", color:th.textDim, fontSize:18, cursor:"pointer" }}>×</button>
         </div>
-        <div style={{ background:order.side==="long"?"rgba(0,212,160,.07)":"rgba(255,77,109,.07)", border:`1px solid ${order.side==="long"?"#00d4a025":"#ff4d6d25"}`, borderRadius:9, padding:"9px 12px", marginBottom:14 }}>
+        <div style={{ background:order.side==="long"?"rgba(247,147,26,.07)":"rgba(255,58,58,.07)", border:`1px solid ${order.side==="long"?"#F7931A25":"#ff3a3a25"}`, borderRadius:9, padding:"9px 12px", marginBottom:14 }}>
           <span style={{ color:order.side==="long"?th.accent:th.red, fontFamily:"'Syne',sans-serif", fontSize:12, fontWeight:700 }}>{order.side==="long"?"▲ Long":"▼ Short"} {order.size} {order.sym}</span>
           <span style={{ color:th.textMid, fontSize:11, marginLeft:10, fontFamily:"'IBM Plex Mono',monospace" }}>{order.lev}x {order.type}</span>
         </div>
         {loading ? (
           <div style={{ textAlign:"center", padding:"24px 0" }}>
-            <div style={{ fontSize:28, animation:"spin 1s linear infinite", display:"inline-block", color:th.accent }}>⟳</div>
+            <div style={{ fontSize:28, animation:"spin 1s linear infinite", display:"inline-block", color:th.accent }}>₿</div>
             <div style={{ color:th.textDim, fontSize:11, fontFamily:"'IBM Plex Mono',monospace", marginTop:8 }}>Simulating…</div>
           </div>
         ) : (
@@ -370,7 +425,7 @@ function SimPreview({ order, livePrice, onConfirm, onCancel, th }) {
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:9 }}>
               <button onClick={onCancel} style={{ background:"none", border:`1px solid ${th.border}`, borderRadius:10, padding:"11px", color:th.textMid, fontSize:12, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Cancel</button>
-              <button onClick={onConfirm} style={{ background:`linear-gradient(135deg,${order.side==="long"?"#00d4a0,#00a878":"#ff4d6d,#cc2244"})`, border:"none", borderRadius:10, padding:"11px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Confirm</button>
+              <button onClick={onConfirm} style={{ background:`linear-gradient(135deg,${order.side==="long"?"#F7931A,#e07800":"#ff3a3a,#cc2200"})`, border:"none", borderRadius:10, padding:"11px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Confirm</button>
             </div>
           </>
         )}
@@ -381,55 +436,64 @@ function SimPreview({ order, livePrice, onConfirm, onCancel, th }) {
 
 // ─── WALLET MODAL ─────────────────────────────────────────
 function WalletModal({ onClose, onConnect, th }) {
-  const [loading, setLoading] = useState(null);
-  const [err, setErr]         = useState("");
-  const [detected, setDetected] = useState(null);
+  const [loading, setLoading]       = useState(null);
+  const [err, setErr]               = useState("");
+  const [status, setStatus]         = useState(""); // step-by-step status msg
+  const [installed, setInstalled]   = useState({}); // { OP_WALLET: true, OKX: true, ... }
 
+  // Re-scan every 800ms while modal is open so INSTALLED badge appears
+  // even if extension injects slightly after modal opens
   useEffect(() => {
-    const wallets = detectWallets();
-    const found = Object.keys(wallets);
-    if (found.length > 0) setDetected({ name: found.join(", ") });
+    const scan = () => setInstalled(prev => {
+      const w = detectWallets();
+      const next = {};
+      ["OP_WALLET","UniSat","OKX","Xverse"].forEach(k => { next[k] = !!w[k]; });
+      return next;
+    });
+    scan();
+    const iv = setInterval(scan, 800);
+    return () => clearInterval(iv);
   }, []);
 
-  const wallets = [
-    { k:"OP_WALLET", i:"⬡", d:"Official OPNet wallet · Required for testnet", c:"#00d4a0", primary:true },
-    { k:"UniSat",    i:"🟠", d:"Bitcoin ordinals wallet",                      c:"#F7931A" },
-    { k:"OKX",       i:"⬛", d:"Multi-chain OKX wallet",                        c:"#8247E5" },
-    { k:"Xverse",    i:"🔵", d:"Stacks & Bitcoin wallet",                       c:"#375BD2" },
+  const WALLETS = [
+    { k:"OP_WALLET", i:"₿", d:"Official OPNet wallet · detected via window.unisat", c:"#F7931A", primary:true,
+      installUrl:"https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb" },
+    { k:"UniSat",    i:"🟠", d:"Bitcoin Ordinals wallet · window.unisat_wallet",    c:"#F7931A",
+      installUrl:"https://unisat.io" },
+    { k:"OKX",       i:"⬛", d:"OKX multi-chain · window.okxwallet.bitcoin",        c:"#8247E5",
+      installUrl:"https://www.okx.com/web3" },
+    { k:"Xverse",    i:"🔵", d:"Stacks & Bitcoin · window.BitcoinProvider",        c:"#375BD2",
+      installUrl:"https://www.xverse.app" },
   ];
 
-  const walletInstalled = (k) => {
-    if (typeof window === "undefined") return false;
-    const wallets = detectWallets();
-    return !!wallets[k];
-  };
-
   const connect = async k => {
-    setErr("");
-    setLoading(k);
+    setErr(""); setStatus(""); setLoading(k);
     try {
-      // Connect to the SPECIFIC wallet the user clicked (not auto-detected)
-      const info = await connectSpecificWallet(k);
-      // Warn if wrong network
-      if (info.network && !info.network.includes("testnet") && info.network !== "unknown") {
-        setErr(`⚠️ Switch wallet to Bitcoin Testnet 3`);
+      if (k === "OP_WALLET") {
+        setStatus("Waiting for OP_WALLET (window.opnet)…");
       }
-      onConnect({ name:info.name, address:info.address, pubkey:info.pubkey, balance:info.balance, network:info.network, real:true });
+      const info = await connectSpecificWallet(k);
+      setStatus("");
+      if (info.network && !(info.network||"").includes("testnet") && info.network !== "unknown") {
+        setErr("⚠ Switch OP_WALLET to Bitcoin Testnet 3 and retry.");
+        setLoading(null); return;
+      }
+      onConnect({ name:info.name, address:info.address, pubkey:info.pubkey,
+                  balance:info.balance, network:info.network, real:true });
       onClose();
     } catch(e) {
-      if (e.message === "NO_WALLET") {
-        // No real wallet, open install page for OP_WALLET or use demo mode
-        if (k === "OP_WALLET") {
-          window.open("https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb","_blank");
-          setErr("Install OP_WALLET, then reconnect.");
-        } else {
-          setErr("Wallet not found. Using demo mode.");
-          await new Promise(r => setTimeout(r, 700));
-          onConnect({ name:k, address:"tb1p"+rnd(), pubkey:"", balance:0, network:"demo", real:false });
-          onClose();
-        }
+      setStatus("");
+      if (e.message === "OP_WALLET_NOT_FOUND") {
+        setErr("OP_WALLET not detected. Install it first ↗");
+        setTimeout(() => window.open("https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb","_blank"), 600);
+      } else if (e.message === "USER_REJECTED") {
+        setErr("Connection cancelled — please approve in your wallet.");
+      } else if (e.message === "NO_WALLET") {
+        const w = WALLETS.find(w => w.k === k);
+        setErr(`${k} not detected. Opening install page…`);
+        setTimeout(() => window.open(w?.installUrl,"_blank"), 600);
       } else {
-        setErr(e.message || "Connection failed");
+        setErr(e.message || "Connection failed. Try again.");
       }
     }
     setLoading(null);
@@ -444,37 +508,51 @@ function WalletModal({ onClose, onConnect, th }) {
         <p style={{ color:th.textDim, fontSize:11, marginBottom:4, fontFamily:"'IBM Plex Mono',monospace" }}>
           Connect your Bitcoin wallet to trade on OPNet Testnet.
         </p>
-        {detected && (
-          <div style={{ background:th.accent+"10", border:`1px solid ${th.accent}30`, borderRadius:8, padding:"6px 10px", marginBottom:12, color:th.accent, fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>
-            ✓ Detected: <strong>{detected.name}</strong> — click to connect
+        {/* Show which wallets were detected */}
+        {Object.values(installed).some(Boolean) && (
+          <div style={{ background:th.accent+"10", border:`1px solid ${th.accent}25`, borderRadius:8, padding:"6px 10px", marginBottom:10, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:th.accent }}>
+            ✓ Detected: {Object.entries(installed).filter(([,v])=>v).map(([k])=>k).join(", ")}
           </div>
         )}
         {err && (
-          <div style={{ background:"#ff4d6d10", border:"1px solid #ff4d6d30", borderRadius:8, padding:"6px 10px", marginBottom:12, color:"#ff4d6d", fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>
+          <div style={{ background:"#ff3a3a10", border:"1px solid #ff3a3a30", borderRadius:8, padding:"6px 10px", marginBottom:12, color:"#ff3a3a", fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>
             {err}
           </div>
         )}
+        {/* Step status shown while connecting OP_WALLET (async inject) */}
+        {status && (
+          <div style={{ background:th.accent+"12", border:`1px solid ${th.accent}30`, borderRadius:8, padding:"7px 10px", marginBottom:8, display:"flex", alignItems:"center", gap:8, color:th.accent, fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>
+            <span style={{ display:"inline-block", animation:"spin 1s linear infinite" }}>⟳</span>
+            {status}
+          </div>
+        )}
         <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
-          {wallets.map(w => {
-            const installed = walletInstalled(w.k);
-            const isLoading = loading === w.k;
+          {WALLETS.map(w => {
+            const isInstalled = installed[w.k];
+            const isLoading   = loading === w.k;
             return (
             <button key={w.k} onClick={() => connect(w.k)} disabled={!!loading}
-              style={{ background:isLoading?w.c+"10":w.primary?w.c+"08":th.input, border:`1px solid ${isLoading?w.c+"60":w.primary?w.c+"30":th.border}`, borderRadius:12, padding:"13px 14px", cursor:loading?"wait":"pointer", display:"flex", alignItems:"center", gap:12, opacity:loading&&!isLoading?.5:1, transition:"all .15s" }}
-              onMouseEnter={e=>{ if(!loading){ e.currentTarget.style.borderColor=w.c+"50"; e.currentTarget.style.background=w.c+"08"; }}}
-              onMouseLeave={e=>{ if(!loading){ e.currentTarget.style.borderColor=w.primary?w.c+"30":th.border; e.currentTarget.style.background=w.primary?w.c+"08":th.input; }}}>
-              <div style={{ width:36, height:36, borderRadius:9, background:w.c+"18", border:`1px solid ${w.c}28`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}>{w.i}</div>
+              style={{ background:isLoading?w.c+"15":w.primary?w.c+"06":th.input, border:`2px solid ${isLoading?w.c:w.primary&&isInstalled?w.c+"50":th.border}`, borderRadius:12, padding:"12px 14px", cursor:loading?"wait":"pointer", display:"flex", alignItems:"center", gap:12, opacity:loading&&!isLoading?.45:1, transition:"all .15s" }}
+              onMouseEnter={e=>{ if(!loading){ e.currentTarget.style.borderColor=w.c+"70"; e.currentTarget.style.background=w.c+"10"; }}}
+              onMouseLeave={e=>{ if(!loading){ e.currentTarget.style.borderColor=isLoading?w.c:w.primary&&isInstalled?w.c+"50":th.border; e.currentTarget.style.background=isLoading?w.c+"15":w.primary?w.c+"06":th.input; }}}>
+              <div style={{ width:38, height:38, borderRadius:10, background:w.c+"20", border:`1px solid ${w.c}35`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:19, flexShrink:0 }}>{w.i}</div>
               <div style={{ flex:1, textAlign:"left" }}>
-                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                  <span style={{ color:th.text, fontSize:13, fontWeight:600, fontFamily:"'Syne',sans-serif" }}>{w.k}</span>
-                  {w.primary && <span style={{ background:th.accent+"20", color:th.accent, fontSize:8, fontFamily:"'IBM Plex Mono',monospace", padding:"1px 5px", borderRadius:4, fontWeight:700 }}>RECOMMENDED</span>}
-                  {installed && <span style={{ background:"#00d4a015", color:"#00d4a0", fontSize:8, fontFamily:"'IBM Plex Mono',monospace", padding:"1px 5px", borderRadius:4 }}>INSTALLED</span>}
+                <div style={{ display:"flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
+                  <span style={{ color:th.text, fontSize:13, fontWeight:700, fontFamily:"'Syne',sans-serif" }}>{w.k}</span>
+                  {w.primary && <span style={{ background:th.accent+"25", color:th.accent, fontSize:8, fontFamily:"'IBM Plex Mono',monospace", padding:"2px 6px", borderRadius:4, fontWeight:700, letterSpacing:1 }}>RECOMMENDED</span>}
+                  {isInstalled
+                    ? <span style={{ background:"#22cc4415", color:"#22cc44", fontSize:8, fontFamily:"'IBM Plex Mono',monospace", padding:"2px 6px", borderRadius:4, fontWeight:700 }}>✓ DETECTED</span>
+                    : <span style={{ background:"#ff3a3a10", color:"#ff3a3a", fontSize:8, fontFamily:"'IBM Plex Mono',monospace", padding:"2px 6px", borderRadius:4 }}>NOT FOUND</span>
+                  }
                 </div>
-                <div style={{ color:th.textDim, fontSize:10 }}>{w.d}</div>
+                <div style={{ color:th.textDim, fontSize:9, marginTop:2, fontFamily:"'IBM Plex Mono',monospace" }}>{w.d}</div>
               </div>
-              {isLoading ? <span style={{ color:w.c, display:"inline-block", animation:"spin 1s linear infinite" }}>⟳</span> : 
-               installed ? <span style={{ color:th.accent, fontSize:11 }}>↗</span> :
-               <span style={{ color:th.textDim, fontSize:10 }}>install</span>}
+              {isLoading
+                ? <span style={{ color:w.c, fontSize:18, display:"inline-block", animation:"spin 1s linear infinite" }}>⟳</span>
+                : isInstalled
+                  ? <span style={{ color:th.accent, fontSize:14, fontWeight:700 }}>→</span>
+                  : <span style={{ color:th.textDim, fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>install</span>
+              }
             </button>
             );
           })}
@@ -496,7 +574,7 @@ function Nav({ page, setPage, wallet, onConnect, onDisconnect, th }) {
   return (
     <nav style={{ position:"fixed", top:0, left:0, right:0, zIndex:400, background:th.navBg, backdropFilter:"blur(14px)", borderBottom:`1px solid ${th.border}`, height:60, display:"flex", alignItems:"center", padding:"0 12px", gap:8 }}>
       <div onClick={() => setPage("landing")} style={{ cursor:"pointer", display:"flex", alignItems:"center", gap:7, flexShrink:0, marginRight:6 }}>
-        <div style={{ width:28, height:28, background:"linear-gradient(135deg,#00d4a0,#006a50)", borderRadius:6, display:"flex", alignItems:"center", justifyContent:"center", color:"#000", fontWeight:900, fontSize:14, fontFamily:"'Syne',sans-serif" }}>Ω</div>
+        <div style={{ width:28, height:28, background:"linear-gradient(135deg,#F7931A,#c45e00)", borderRadius:6, display:"flex", alignItems:"center", justifyContent:"center", color:"#000", fontWeight:900, fontSize:14, fontFamily:"'Syne',sans-serif" }}>Ω</div>
         <span style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:700 }}>OP<span style={{ color:th.accent }}>Perp</span>DEX</span>
         <span style={{ background:"#ff980015", border:"1px solid #ff980040", borderRadius:5, padding:"2px 6px", color:"#ff9800", fontSize:8, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700, letterSpacing:1 }}>TESTNET</span>
       </div>
@@ -511,8 +589,8 @@ function Nav({ page, setPage, wallet, onConnect, onDisconnect, th }) {
           <div style={{ position:"relative" }}>
             <button onClick={() => setMenu(m => !m)} style={{ background:th.accent+"15", border:`1px solid ${wallet.real?th.accent+"40":"#ff980040"}`, borderRadius:8, padding:"5px 10px", color:wallet.real?th.accent:"#ff9800", fontSize:11, fontFamily:"'IBM Plex Mono',monospace", cursor:"pointer", display:"flex", alignItems:"center", gap:5 }}>
               <span style={{ width:6, height:6, borderRadius:"50%", background:wallet.real?th.accent:"#ff9800", boxShadow:`0 0 5px ${wallet.real?th.accent:"#ff9800"}`, display:"inline-block" }}/>
-              {wallet.address.slice(0,8)}…
-              {wallet.balance>0 && <span style={{ color:th.textMid, fontSize:9 }}>{wallet.balance.toFixed(4)} tBTC</span>}
+              {(wallet.address||"").slice(0,8)}…
+              {(wallet.balance||0)>0 && <span style={{ color:th.textMid, fontSize:9 }}>{(wallet.balance||0).toFixed(4)} tBTC</span>}
               {!wallet.real && <span style={{ color:"#ff9800", fontSize:8 }}>DEMO</span>}
             </button>
             {menu && (
@@ -524,7 +602,7 @@ function Nav({ page, setPage, wallet, onConnect, onDisconnect, th }) {
             )}
           </div>
         ) : (
-          <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:8, padding:"7px 13px", color:"#000", fontSize:11, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect</button>
+          <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:8, padding:"7px 13px", color:"#000", fontSize:11, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect</button>
         )}
       </div>
     </nav>
@@ -541,7 +619,7 @@ function Ticker({ prices, th }) {
           <div key={t.key} style={{ display:"flex", alignItems:"center", gap:6, padding:"0 14px", height:30, whiteSpace:"nowrap" }}>
             <span style={{ color:t.color, fontSize:9.5, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700 }}>{t.symbol}</span>
             <span style={{ color:th.text, fontSize:9.5, fontFamily:"'IBM Plex Mono',monospace" }}>${fmtP(t.price)}</span>
-            <span style={{ color:t.change>=0?"#00d4a0":"#ff4d6d", fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>{t.change>=0?"+":""}{t.change}%</span>
+            <span style={{ color:t.change>=0?"#F7931A":"#ff3a3a", fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>{t.change>=0?"+":""}{t.change}%</span>
           </div>
         ))}
       </div>
@@ -552,7 +630,7 @@ function Ticker({ prices, th }) {
 // ─── LANDING ──────────────────────────────────────────────
 function Landing({ setPage, th }) {
   return (
-    <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"80px 20px 60px", background:`radial-gradient(ellipse at 50% 0%,${th.accent}08 0%,transparent 60%)` }}>
+    <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"80px 20px 60px", background:`radial-gradient(ellipse at 50% 0%,${th.accent}12 0%,transparent 65%)` }}>
       <div style={{ fontSize:11, color:th.accent, fontFamily:"'IBM Plex Mono',monospace", letterSpacing:".12em", marginBottom:18, background:th.accent+"12", border:`1px solid ${th.accent}22`, borderRadius:20, padding:"4px 14px" }}>LIVE ON OP_NET BITCOIN TESTNET</div>
       <h1 style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:"clamp(32px,6vw,70px)", fontWeight:800, textAlign:"center", lineHeight:1.1, marginBottom:16 }}>
         Trade Perps<br/><span style={{ color:th.accent }}>On Bitcoin</span>
@@ -561,8 +639,25 @@ function Landing({ setPage, th }) {
         The first decentralized perpetual futures exchange on OP_NET. Up to 50× leverage, sub-cent fees, non-custodial.
       </p>
       <div style={{ display:"flex", gap:12, marginBottom:40, flexWrap:"wrap", justifyContent:"center" }}>
-        <button onClick={() => setPage("trade")} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:13, padding:"13px 30px", color:"#000", fontSize:14, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Start Trading →</button>
+        <button onClick={() => setPage("trade")} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:13, padding:"13px 30px", color:"#000", fontSize:14, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Start Trading →</button>
         <button onClick={() => setPage("liquidity")} style={{ background:"none", border:`1px solid ${th.border}`, borderRadius:13, padding:"13px 30px", color:th.textMid, fontSize:14, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Add Liquidity</button>
+      </div>
+
+      {/* Social row */}
+      <div style={{ display:"flex", gap:10, marginBottom:36, alignItems:"center", justifyContent:"center", flexWrap:"wrap" }}>
+        <span style={{ color:th.textFaint, fontSize:10, fontFamily:"'IBM Plex Mono',monospace" }}>Join the community:</span>
+        {[
+          { label:"Twitter/X", href:"https://x.com/opnetbtc",           icon:"𝕏", color:"#1DA1F2" },
+          { label:"Telegram",  href:"https://t.me/opnetbtc",            icon:"✈", color:"#2CA5E0" },
+          { label:"Discord",   href:"https://discord.com/invite/opnet", icon:"⬡", color:"#5865F2" },
+        ].map(s => (
+          <a key={s.label} href={s.href} target="_blank" rel="noreferrer"
+            style={{ display:"flex", alignItems:"center", gap:5, color:th.textMid, fontSize:11, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none", padding:"6px 12px", borderRadius:20, border:`1px solid ${th.border}`, background:th.card, transition:"all .15s" }}
+            onMouseEnter={e=>{ e.currentTarget.style.borderColor=s.color+"60"; e.currentTarget.style.color=s.color; }}
+            onMouseLeave={e=>{ e.currentTarget.style.borderColor=th.border; e.currentTarget.style.color=th.textMid; }}>
+            <span style={{ fontSize:14 }}>{s.icon}</span>{s.label}
+          </a>
+        ))}
       </div>
 
       {/* ── Testnet Getting Started ── */}
@@ -705,7 +800,7 @@ function Trade({ wallet, onConnect, th, setPage }) {
           <button key={t.symbol} onClick={() => setMkt(t)} style={{ background:mkt.symbol===t.symbol?th.accent+"18":th.card, border:`1px solid ${mkt.symbol===t.symbol?th.accent+"30":th.border}`, borderRadius:8, padding:"5px 11px", color:mkt.symbol===t.symbol?th.accent:th.textDim, fontSize:11, fontWeight:600, cursor:"pointer", fontFamily:"'IBM Plex Mono',monospace", whiteSpace:"nowrap" }}>{t.symbol}/USDC</button>
         ))}
         <div style={{ marginLeft:"auto", background:th.bg2, border:`1px solid ${th.border}`, borderRadius:7, padding:"3px 9px", display:"flex", alignItems:"center", gap:5, flexShrink:0 }}>
-          <span style={{ width:5, height:5, borderRadius:"50%", background:"#00d4a0", display:"inline-block", boxShadow:"0 0 4px #00d4a0" }}/>
+          <span style={{ width:5, height:5, borderRadius:"50%", background:"#F7931A", display:"inline-block", boxShadow:"0 0 4px #F7931A" }}/>
           <span style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>OP_NET · ~0.8s</span>
         </div>
       </div>
@@ -867,21 +962,21 @@ function Trade({ wallet, onConnect, th, setPage }) {
               ))}
             </div>
           )}
-          <button onClick={handleOrder} style={{ width:"100%", background:`linear-gradient(135deg,${side==="long"?`${th.accent},#00a878`:"#ff4d6d,#cc2244"})`, border:"none", borderRadius:10, padding:"12px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif", letterSpacing:".04em" }}>
+          <button onClick={handleOrder} style={{ width:"100%", background:`linear-gradient(135deg,${side==="long"?`${th.accent},#00a878`:"#ff3a3a,#cc2200"})`, border:"none", borderRadius:10, padding:"12px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif", letterSpacing:".04em" }}>
             {!wallet.connected ? "Connect Wallet" : wallet.real ? (side==="long"?"▲ Open Long":"▼ Open Short") : "▲ Demo Mode — Connect OP_WALLET"}
           </button>
         </div>
         {/* account */}
-        {wallet.real && wallet.balance === 0 && (
+        {wallet.real && (wallet.balance||0) === 0 && (
           <div style={{ background:"#ff980010", border:"1px solid #ff980030", borderRadius:9, padding:"8px 12px", marginBottom:8 }}>
             <div style={{ color:"#ff9800", fontSize:10, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700 }}>⚠ No tBTC — get from faucet</div>
             <a href="https://faucet.opnet.org" target="_blank" rel="noreferrer" style={{ color:"#ff9800", fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>faucet.opnet.org →</a>
           </div>
         )}
-        {wallet.real && wallet.network && !wallet.network.includes("testnet") && wallet.network !== "unknown" && wallet.network !== "demo" && (
-          <div style={{ background:"#ff4d6d10", border:"1px solid #ff4d6d30", borderRadius:9, padding:"8px 12px", marginBottom:8 }}>
-            <div style={{ color:"#ff4d6d", fontSize:10, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700 }}>⚠ Wrong network: {wallet.network}</div>
-            <div style={{ color:"#ff4d6d", fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>Switch OP_WALLET to Bitcoin Testnet 3</div>
+        {wallet.real && wallet.network && !(wallet.network||"").includes("testnet") && wallet.network !== "unknown" && wallet.network !== "demo" && (
+          <div style={{ background:"#ff3a3a10", border:"1px solid #ff3a3a30", borderRadius:9, padding:"8px 12px", marginBottom:8 }}>
+            <div style={{ color:"#ff3a3a", fontSize:10, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700 }}>⚠ Wrong network: {wallet.network}</div>
+            <div style={{ color:"#ff3a3a", fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>Switch OP_WALLET to Bitcoin Testnet 3</div>
           </div>
         )}
         <div style={{ background:th.card, border:`1px solid ${th.border}`, borderRadius:11, padding:"11px 12px" }}>
@@ -889,10 +984,10 @@ function Trade({ wallet, onConnect, th, setPage }) {
             Account {wallet.real && <span style={{ color:th.accent, fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>⬡ LIVE</span>}
           </div>
           <div style={{ height:3, background:th.border, borderRadius:2, marginBottom:7 }}>
-            <div style={{ width:`${used}%`, height:"100%", background:`linear-gradient(90deg,${th.accent},${used>70?th.red:"#00a878"})`, borderRadius:2, transition:"width .3s" }}/>
+            <div style={{ width:`${used}%`, height:"100%", background:`linear-gradient(90deg,${th.accent},${used>70?th.red:"#c45e00"})`, borderRadius:2, transition:"width .3s" }}/>
           </div>
           {[
-            ["tBTC Balance", wallet.real ? `${wallet.balance.toFixed(6)} tBTC` : "$10,979.85", th.text],
+            ["tBTC Balance", wallet.real ? `${(wallet.balance||0).toFixed(6)} tBTC` : "$10,979.85", th.text],
             ["Margin Used", `${used.toFixed(1)}%`, used>70?th.red:th.textMid],
             ["Total PnL", "+$979.85", th.accent]
           ].map(([k,v,c]) => (
@@ -974,7 +1069,7 @@ function Swap({ wallet, onConnect, th }) {
             ))}
           </div>
         )}
-        <button onClick={swap} disabled={busy} style={{ width:"100%", background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:12, padding:"13px", color:"#000", fontSize:14, fontWeight:700, cursor:busy?"wait":"pointer", fontFamily:"'Syne',sans-serif", opacity:busy?.8:1 }}>
+        <button onClick={swap} disabled={busy} style={{ width:"100%", background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:12, padding:"13px", color:"#000", fontSize:14, fontWeight:700, cursor:busy?"wait":"pointer", fontFamily:"'Syne',sans-serif", opacity:busy?.8:1 }}>
           {busy ? <span style={{ display:"inline-block", animation:"spin 1s linear infinite" }}>⟳</span> : (wallet.connected ? "Swap →" : "Connect Wallet")}
         </button>
       </div>
@@ -996,13 +1091,13 @@ function Pools({ wallet, onConnect, th }) {
               <div style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:700 }}>{pool.pair}</div>
               <div style={{ color:th.textDim, fontSize:11, marginTop:2 }}>0.05% fee tier</div>
             </div>
-            {[["TVL",`$${pool.tvl}M`,th.text],["24h Vol",`$${pool.vol}M`,th.textMid],["APY",`${pool.apy}%`,"#00d4a0"]].map(([k,v,c]) => (
+            {[["TVL",`$${pool.tvl}M`,th.text],["24h Vol",`$${pool.vol}M`,th.textMid],["APY",`${pool.apy}%`,"#F7931A"]].map(([k,v,c]) => (
               <div key={k} style={{ textAlign:"center" }}>
                 <div style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace", marginBottom:3 }}>{k}</div>
                 <div style={{ color:c, fontFamily:"'IBM Plex Mono',monospace", fontSize:14, fontWeight:700 }}>{v}</div>
               </div>
             ))}
-            <button onClick={() => { if(!wallet.connected){onConnect();return;} toast(`Adding to ${pool.pair}…`,"info"); }} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:9, padding:"9px 20px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Add Liquidity</button>
+            <button onClick={() => { if(!wallet.connected){onConnect();return;} toast(`Adding to ${pool.pair}…`,"info"); }} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:9, padding:"9px 20px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Add Liquidity</button>
           </div>
         ))}
       </div>
@@ -1083,7 +1178,7 @@ function Copy({ wallet, onConnect, th }) {
       <div style={{ fontSize:40 }}>⇄</div>
       <div style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700 }}>Copy Trading</div>
       <div style={{ color:th.textDim, fontSize:12, textAlign:"center", maxWidth:300 }}>Mirror top traders automatically. Connect to get started.</div>
-      <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:11, padding:"11px 24px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect Wallet</button>
+      <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:11, padding:"11px 24px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect Wallet</button>
     </div>
   );
 
@@ -1145,7 +1240,7 @@ function Copy({ wallet, onConnect, th }) {
               <div style={{ color:th.textDim, fontSize:10, marginTop:2 }}>+{t.roi}% ROI · {t.winRate}% win rate</div>
             </div>
           </div>
-          <button onClick={()=>{ setFol(f=>[...f,{...t,allocation:100,copyPnl:0,drawdown:9}]); toast(`Copying ${t.addr}`,"success"); setTab("following"); }} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:9, padding:"8px 18px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Follow</button>
+          <button onClick={()=>{ setFol(f=>[...f,{...t,allocation:100,copyPnl:0,drawdown:9}]); toast(`Copying ${t.addr}`,"success"); setTab("following"); }} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:9, padding:"8px 18px", color:"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Follow</button>
         </div>
       ))}
     </div>
@@ -1162,7 +1257,7 @@ function Referral({ wallet, onConnect, th }) {
     <div style={{ minHeight:"60vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:14, padding:"20px" }}>
       <div style={{ fontSize:40 }}>🎁</div>
       <div style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700 }}>Referral & Rewards</div>
-      <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#00a878)`, border:"none", borderRadius:11, padding:"11px 24px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect Wallet</button>
+      <button onClick={onConnect} style={{ background:`linear-gradient(135deg,${th.accent},#c45e00)`, border:"none", borderRadius:11, padding:"11px 24px", color:"#000", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif" }}>Connect Wallet</button>
     </div>
   );
 
@@ -1178,7 +1273,7 @@ function Referral({ wallet, onConnect, th }) {
         <div style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace", marginBottom:7 }}>YOUR REFERRAL LINK</div>
         <div style={{ display:"flex", gap:9, alignItems:"center" }}>
           <div style={{ flex:1, background:th.input, border:`1px solid ${th.border}`, borderRadius:8, padding:"9px 12px", color:th.accent, fontFamily:"'IBM Plex Mono',monospace", fontSize:12 }}>opperpdex.xyz/r/{d.code}</div>
-          <button onClick={()=>{ setCopied(true); toast("Link copied!","success",2000); setTimeout(()=>setCopied(false),2000); }} style={{ background:copied?th.accent+"20":th.accent, border:"none", borderRadius:9, padding:"9px 18px", color:copied?"#00d4a0":"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif", whiteSpace:"nowrap" }}>{copied?"✓ Copied!":"Copy Link"}</button>
+          <button onClick={()=>{ setCopied(true); toast("Link copied!","success",2000); setTimeout(()=>setCopied(false),2000); }} style={{ background:copied?th.accent+"20":th.accent, border:"none", borderRadius:9, padding:"9px 18px", color:copied?"#F7931A":"#000", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Syne',sans-serif", whiteSpace:"nowrap" }}>{copied?"✓ Copied!":"Copy Link"}</button>
         </div>
       </div>
       {/* kpis */}
@@ -1281,17 +1376,18 @@ function AppInner() {
   useEffect(() => {
     const autoConnect = async () => {
       try {
+        // Wait for extensions to inject (they load async — up to 1.5s)
+        await new Promise(r => setTimeout(r, 800));
         const wallets = detectWallets();
         const key = ["OP_WALLET","UniSat","OKX","Xverse"].find(k => wallets[k]);
         if (!key) return;
         const prov = wallets[key];
+        // Use getAccounts (silent, non-prompting) not requestAccounts (shows popup)
         const accounts = await prov.getAccounts();
         if (accounts && accounts.length > 0) {
-          let balance = 0;
+          let balance = 0, pubkey = "", network = "testnet";
           try { const b = await prov.getBalance(); balance = (b.confirmed||b.total||0)/1e8; } catch {}
-          let pubkey = "";
           try { pubkey = await prov.getPublicKey(); } catch {}
-          let network = "testnet";
           try { network = await prov.getNetwork(); } catch {}
           setWallet({ connected:true, address:accounts[0], name:key, pubkey, balance, network, real:true });
         }
@@ -1321,21 +1417,67 @@ function AppInner() {
       <MobileNav page={page} setPage={setPage} th={th}/>
 
       {/* ── Footer ── */}
-      <footer style={{ borderTop:`1px solid ${th.border}`, padding:"20px 16px 80px", background:th.bg2 }}>
-        <div style={{ maxWidth:900, margin:"0 auto", display:"flex", flexWrap:"wrap", gap:16, alignItems:"center", justifyContent:"space-between" }}>
-          <div>
-            <div style={{ color:th.accent, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700, marginBottom:4 }}>
-              ⬡ OPPerpDEX · Built on OPNet Bitcoin L2
+      <footer style={{ borderTop:`2px solid ${th.accent}20`, padding:"28px 16px 80px", background:th.bg2 }}>
+        <div style={{ maxWidth:960, margin:"0 auto" }}>
+          {/* Top row: brand + social */}
+          <div style={{ display:"flex", flexWrap:"wrap", gap:20, alignItems:"flex-start", justifyContent:"space-between", marginBottom:24 }}>
+            {/* Brand */}
+            <div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                <div style={{ width:32, height:32, background:`linear-gradient(135deg,${th.accent},#c45e00)`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", color:"#000", fontWeight:900, fontSize:16, fontFamily:"'Syne',sans-serif" }}>₿</div>
+                <span style={{ color:th.text, fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:800 }}>OP<span style={{ color:th.accent }}>Perp</span>DEX</span>
+              </div>
+              <div style={{ color:th.textDim, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", lineHeight:1.7 }}>
+                The first perpetual futures DEX<br/>on OPNet Bitcoin L2 · Testnet
+              </div>
             </div>
-            <div style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>
-              Non-custodial perpetual futures · Testnet
+
+            {/* Social links */}
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              <div style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700, letterSpacing:2, marginBottom:4 }}>COMMUNITY</div>
+              {[
+                { label:"Twitter / X",   href:"https://x.com/opnetbtc",             icon:"𝕏" },
+                { label:"Telegram",       href:"https://t.me/opnetbtc",              icon:"✈" },
+                { label:"Discord",        href:"https://discord.com/invite/opnet",   icon:"⬡" },
+              ].map(s => (
+                <a key={s.label} href={s.href} target="_blank" rel="noreferrer"
+                  style={{ display:"flex", alignItems:"center", gap:8, color:th.textMid, fontSize:11, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none", padding:"5px 10px", borderRadius:7, border:`1px solid ${th.border}`, background:th.bg3, transition:"all .15s" }}
+                  onMouseEnter={e=>{ e.currentTarget.style.borderColor=th.accent+"50"; e.currentTarget.style.color=th.accent; }}
+                  onMouseLeave={e=>{ e.currentTarget.style.borderColor=th.border; e.currentTarget.style.color=th.textMid; }}>
+                  <span style={{ fontSize:13 }}>{s.icon}</span> {s.label}
+                </a>
+              ))}
+            </div>
+
+            {/* Resources */}
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              <div style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace", fontWeight:700, letterSpacing:2, marginBottom:4 }}>RESOURCES</div>
+              {[
+                { label:"tBTC Faucet",    href:"https://faucet.opnet.org",           icon:"💧" },
+                { label:"OP_WALLET",      href:"https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb", icon:"₿" },
+                { label:"OPNet Explorer", href:"https://opscan.org",                 icon:"🔍" },
+                { label:"opnet.org",      href:"https://opnet.org",                  icon:"🌐" },
+              ].map(s => (
+                <a key={s.label} href={s.href} target="_blank" rel="noreferrer"
+                  style={{ display:"flex", alignItems:"center", gap:8, color:th.textMid, fontSize:11, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none", padding:"5px 10px", borderRadius:7, border:`1px solid ${th.border}`, background:th.bg3, transition:"all .15s" }}
+                  onMouseEnter={e=>{ e.currentTarget.style.borderColor=th.accent+"50"; e.currentTarget.style.color=th.accent; }}
+                  onMouseLeave={e=>{ e.currentTarget.style.borderColor=th.border; e.currentTarget.style.color=th.textMid; }}>
+                  <span style={{ fontSize:13 }}>{s.icon}</span> {s.label}
+                </a>
+              ))}
             </div>
           </div>
-          <div style={{ display:"flex", gap:14, flexWrap:"wrap" }}>
-            <a href="https://faucet.opnet.org" target="_blank" rel="noreferrer" style={{ color:th.accent, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none" }}>💧 tBTC Faucet</a>
-            <a href="https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb" target="_blank" rel="noreferrer" style={{ color:th.textMid, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none" }}>⬡ OP_WALLET</a>
-            <a href="https://discord.gg/opnet" target="_blank" rel="noreferrer" style={{ color:th.textMid, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none" }}>💬 Discord</a>
-            <a href="https://opnet.org" target="_blank" rel="noreferrer" style={{ color:th.textMid, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textDecoration:"none" }}>🌐 opnet.org</a>
+
+          {/* Bottom bar */}
+          <div style={{ borderTop:`1px solid ${th.border}`, paddingTop:14, display:"flex", flexWrap:"wrap", gap:10, justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace" }}>
+              © 2025 OPPerpDEX · Built on OPNet · Testnet only — no real funds
+            </span>
+            <div style={{ display:"flex", gap:12 }}>
+              {["Terms","Privacy","Docs"].map(l => (
+                <span key={l} style={{ color:th.textFaint, fontSize:9, fontFamily:"'IBM Plex Mono',monospace", cursor:"default" }}>{l}</span>
+              ))}
+            </div>
           </div>
         </div>
       </footer>

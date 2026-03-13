@@ -338,7 +338,7 @@ function OrderBook({ mid, onFill, th }) {
       style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", padding:"2px 8px", cursor:"pointer", position:"relative" }}
       onMouseEnter={e => e.currentTarget.style.background = side==="sell"?"rgba(255,77,109,0.08)":"rgba(0,212,160,0.08)"}
       onMouseLeave={e => e.currentTarget.style.background = "none"}>
-      <div style={{ position:"absolute", right:0, top:0, bottom:0, width:`${(row.total/maxT)*100}%`, background:side==="sell"?"rgba(255,77,109,0.07)":"rgba(0,212,160,0.07)" }}/>
+      <div style={{ position:"absolute", right:0, top:0, bottom:0, width:`${(row.total/maxT)*100}%`, background:side==="sell"?"rgba(255,77,109,0.07)":"rgba(0,212,160,0.07)" }} />
       <span style={{ color:side==="sell"?th.red:th.accent, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", position:"relative" }}>{fmtP(row.price)}</span>
       <span style={{ color:th.textMid, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textAlign:"center", position:"relative" }}>{row.size}</span>
       <span style={{ color:th.textDim, fontSize:10, fontFamily:"'IBM Plex Mono',monospace", textAlign:"right", position:"relative" }}>{row.total}</span>
@@ -490,8 +490,16 @@ function WalletModal({ onClose, onConnect, th }) {
         setErr("Connection cancelled — please approve in your wallet.");
       } else if (e.message === "NO_WALLET") {
         const w = WALLETS.find(w => w.k === k);
-        setErr(`${k} not detected. Opening install page…`);
-        setTimeout(() => window.open(w?.installUrl,"_blank"), 600);
+        if (k === "OP_WALLET") {
+          setErr("OP_WALLET not found. Install it first ↗");
+          setTimeout(() => window.open(w?.installUrl,"_blank"), 600);
+        } else {
+          // Non-OP_WALLET: offer demo mode so users can still explore the UI
+          setErr(`${k} not detected — entering demo mode.`);
+          await new Promise(r => setTimeout(r, 700));
+          onConnect({ name:k, address:"tb1p"+rnd(), pubkey:"", balance:0, network:"demo", real:false });
+          onClose();
+        }
       } else {
         setErr(e.message || "Connection failed. Try again.");
       }
@@ -1012,6 +1020,7 @@ function Trade({ wallet, onConnect, th, setPage }) {
       {preview && <SimPreview order={preview} livePrice={price} onConfirm={confirmOrder} onCancel={()=>setPv(null)} th={th}/>}
       <TxOverlay tx={tx} onDismiss={()=>setTx(null)} th={th}/>
     </div>
+  </div>
   );
 }
 // ─── SWAP ────────────────────────────────────────────────
